@@ -4,12 +4,18 @@ const fs = require('fs').promises;
 const { google } = require('googleapis');
 const { OAuth2Client } = require('google-auth-library');
 const http = require('http');
+const chokidar = require('chokidar');
 require('dotenv').config();
 
 let oauth2Client;
 let drive;
 let authServer;
 let mainWindow;
+let fileWatcher;
+let watchedFolder = null;
+let driveMapping = new Map(); // Maps local paths to Drive file IDs
+let pendingChanges = new Map(); // Maps file paths to change info
+let lastSyncTime = null;
 
 const SCOPES = ['https://www.googleapis.com/auth/drive.file'];
 
@@ -286,6 +292,345 @@ ipcMain.handle('sync-gdrive', async (event, options = {}) => {
     };
   } catch (error) {
     console.log('Upload error in main process:', error.message); // Debug logging
+    return { success: false, error: error.message };
+  }
+});
+
+async function findDriveFileByName(fileName, parentFolderId = null) {
+  try {
+    let query = `name='${fileName}' and trashed=false`;
+    if (parentFolderId) {
+      query += ` and '${parentFolderId}' in parents`;
+    }
+
+    const response = await drive.files.list({
+      q: query,
+      fields: 'files(id, name, mimeType)',
+    });
+
+    return response.data.files.length > 0 ? response.data.files[0] : null;
+  } catch (error) {
+    console.error('Error finding Drive file:', error);
+    return null;
+  }
+}
+
+async function updateDriveFile(fileId, filePath) {
+  try {
+    const media = {
+      body: require('fs').createReadStream(filePath),
+    };
+
+    const response = await drive.files.update({
+      fileId: fileId,
+      media: media,
+      fields: 'id, name, size',
+    });
+
+    return { success: true, file: response.data };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+}
+
+async function deleteDriveFile(fileId) {
+  try {
+    await drive.files.delete({
+      fileId: fileId,
+    });
+    return { success: true };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+}
+
+function startFileWatching(folderPath, driveFolderId) {
+  if (fileWatcher) {
+    fileWatcher.close();
+  }
+
+  watchedFolder = folderPath;
+
+  fileWatcher = chokidar.watch(folderPath, {
+    ignored: /(^|[\/\\])\../, // ignore dotfiles
+    persistent: true,
+    ignoreInitial: true,
+    awaitWriteFinish: {
+      stabilityThreshold: 2000,
+      pollInterval: 100
+    }
+  });
+
+  fileWatcher.on('add', async (filePath) => {
+    console.log(`File added: ${filePath}`);
+    pendingChanges.set(filePath, {
+      type: 'add',
+      path: filePath,
+      status: 'pending',
+      timestamp: new Date()
+    });
+
+    if (mainWindow) {
+      mainWindow.webContents.send('file-change', {
+        type: 'add',
+        path: filePath,
+        status: 'pending',
+        timestamp: new Date()
+      });
+    }
+  });
+
+  fileWatcher.on('change', async (filePath) => {
+    console.log(`File changed: ${filePath}`);
+    pendingChanges.set(filePath, {
+      type: 'change',
+      path: filePath,
+      status: 'pending',
+      timestamp: new Date()
+    });
+
+    if (mainWindow) {
+      mainWindow.webContents.send('file-change', {
+        type: 'change',
+        path: filePath,
+        status: 'pending',
+        timestamp: new Date()
+      });
+    }
+  });
+
+  fileWatcher.on('unlink', async (filePath) => {
+    console.log(`File deleted: ${filePath}`);
+    pendingChanges.set(filePath, {
+      type: 'delete',
+      path: filePath,
+      status: 'pending',
+      timestamp: new Date()
+    });
+
+    if (mainWindow) {
+      mainWindow.webContents.send('file-change', {
+        type: 'delete',
+        path: filePath,
+        status: 'pending',
+        timestamp: new Date()
+      });
+    }
+  });
+
+  if (mainWindow) {
+    mainWindow.webContents.send('watch-status', {
+      watching: true,
+      folder: folderPath
+    });
+  }
+}
+
+function stopFileWatching() {
+  if (fileWatcher) {
+    fileWatcher.close();
+    fileWatcher = null;
+    watchedFolder = null;
+    driveMapping.clear();
+    pendingChanges.clear();
+    lastSyncTime = null;
+
+    if (mainWindow) {
+      mainWindow.webContents.send('watch-status', {
+        watching: false,
+        folder: null
+      });
+    }
+  }
+}
+
+ipcMain.handle('start-watching', async (event, options = {}) => {
+  try {
+    const { folderPath, driveFolderId } = options;
+    if (!folderPath || !driveFolderId) {
+      return { success: false, error: 'Folder path and Drive folder ID required' };
+    }
+
+    startFileWatching(folderPath, driveFolderId);
+    return { success: true };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('stop-watching', async () => {
+  try {
+    stopFileWatching();
+    return { success: true };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('get-watch-status', async () => {
+  return {
+    watching: !!fileWatcher,
+    folder: watchedFolder,
+    lastSyncTime: lastSyncTime,
+    pendingChangesCount: pendingChanges.size
+  };
+});
+
+ipcMain.handle('sync-pending-changes', async (event, options = {}) => {
+  try {
+    if (!oauth2Client.credentials || !oauth2Client.credentials.access_token) {
+      return { success: false, error: 'Not authenticated' };
+    }
+
+    if (pendingChanges.size === 0) {
+      return { success: true, message: 'No pending changes to sync', syncResults: [] };
+    }
+
+    const { driveFolderId } = options;
+    if (!driveFolderId) {
+      return { success: false, error: 'Drive folder ID required' };
+    }
+
+    const syncResults = [];
+    const changes = Array.from(pendingChanges.values());
+
+    for (const change of changes) {
+      const { type, path: filePath } = change;
+
+      try {
+        if (type === 'add' || type === 'change') {
+          // Check if file still exists
+          const fileExists = await fs.access(filePath).then(() => true).catch(() => false);
+          if (!fileExists) {
+            // File was deleted after being detected, skip
+            pendingChanges.delete(filePath);
+            continue;
+          }
+
+          const relativePath = path.relative(watchedFolder, filePath);
+          const fileName = path.basename(filePath);
+          const dirPath = path.dirname(relativePath);
+
+          let parentId = driveFolderId;
+          if (dirPath !== '.') {
+            // Handle nested folders - create if needed
+            const folders = dirPath.split(path.sep);
+            for (const folder of folders) {
+              const existingFolder = await findDriveFileByName(folder, parentId);
+              if (existingFolder && existingFolder.mimeType === 'application/vnd.google-apps.folder') {
+                parentId = existingFolder.id;
+              } else {
+                const newFolder = await createGoogleDriveFolder(folder, parentId);
+                if (newFolder.success) {
+                  parentId = newFolder.folder.id;
+                }
+              }
+            }
+          }
+
+          let result;
+          if (type === 'change' && driveMapping.has(filePath)) {
+            // Update existing file
+            const driveFileId = driveMapping.get(filePath);
+            result = await updateDriveFile(driveFileId, filePath);
+          } else {
+            // Upload new file
+            result = await uploadFileToGoogleDrive(filePath, fileName, parentId);
+            if (result.success) {
+              driveMapping.set(filePath, result.file.id);
+            }
+          }
+
+          syncResults.push({
+            path: filePath,
+            type: type,
+            success: result.success,
+            error: result.success ? null : result.error
+          });
+
+          if (mainWindow) {
+            mainWindow.webContents.send('file-change', {
+              type: type,
+              path: filePath,
+              status: result.success ? 'synced' : 'error',
+              error: result.success ? null : result.error
+            });
+          }
+
+        } else if (type === 'delete') {
+          const driveFileId = driveMapping.get(filePath);
+          if (driveFileId) {
+            const result = await deleteDriveFile(driveFileId);
+            driveMapping.delete(filePath);
+
+            syncResults.push({
+              path: filePath,
+              type: type,
+              success: result.success,
+              error: result.success ? null : result.error
+            });
+
+            if (mainWindow) {
+              mainWindow.webContents.send('file-change', {
+                type: type,
+                path: filePath,
+                status: result.success ? 'synced' : 'error',
+                error: result.success ? null : result.error
+              });
+            }
+          }
+        }
+
+        // Remove from pending changes if successful
+        if (syncResults[syncResults.length - 1]?.success) {
+          pendingChanges.delete(filePath);
+        }
+
+      } catch (error) {
+        syncResults.push({
+          path: filePath,
+          type: type,
+          success: false,
+          error: error.message
+        });
+
+        if (mainWindow) {
+          mainWindow.webContents.send('file-change', {
+            type: type,
+            path: filePath,
+            status: 'error',
+            error: error.message
+          });
+        }
+      }
+    }
+
+    lastSyncTime = new Date();
+
+    const successCount = syncResults.filter(r => r.success).length;
+    const totalCount = syncResults.length;
+
+    if (mainWindow) {
+      mainWindow.webContents.send('sync-complete', {
+        timestamp: lastSyncTime,
+        successCount,
+        totalCount,
+        pendingChangesCount: pendingChanges.size
+      });
+    }
+
+    return {
+      success: true,
+      syncResults,
+      summary: {
+        totalSynced: successCount,
+        totalAttempted: totalCount,
+        pendingRemaining: pendingChanges.size
+      },
+      lastSyncTime
+    };
+
+  } catch (error) {
     return { success: false, error: error.message };
   }
 });
