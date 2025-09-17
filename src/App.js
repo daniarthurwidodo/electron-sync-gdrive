@@ -77,17 +77,29 @@ const App = () => {
     }
 
     setIsLoading(true);
+    setNotification('Uploading folder to Google Drive...');
+
     try {
       const result = await ipcRenderer.invoke('sync-gdrive', { folderPath: selectedFolder });
-      if (result.success) {
-        setNotification('Sync completed successfully!');
-        setTimeout(() => setNotification(''), 3000);
-        console.log('Sync successful:', result.files);
+      console.log('Upload result:', result); // Debug logging
+
+      if (result.success && result.summary) {
+        const { summary } = result;
+        setNotification(
+          `Upload completed! Files: ${summary.successfulFiles}/${summary.totalFiles}, ` +
+          `Folders: ${summary.successfulFolders}/${summary.totalFolders}`
+        );
+        setTimeout(() => setNotification(''), 5000);
+        console.log('Upload successful:', result);
       } else {
-        console.error('Sync failed:', result.error);
+        setNotification(`Upload failed: ${result.error || 'Unknown error'}`);
+        setTimeout(() => setNotification(''), 5000);
+        console.error('Upload failed - Full result:', result);
       }
     } catch (error) {
-      console.error('Sync error:', error);
+      setNotification(`Upload error: ${error.message}`);
+      setTimeout(() => setNotification(''), 5000);
+      console.error('Upload error:', error);
     } finally {
       setIsLoading(false);
     }
@@ -171,7 +183,7 @@ const App = () => {
               cursor: (isLoading || !selectedFolder) ? 'not-allowed' : 'pointer'
             }}
           >
-            {isLoading ? 'Syncing...' : 'Sync Google Drive'}
+            {isLoading ? 'Uploading to Google Drive...' : 'Upload Folder to Google Drive'}
           </button>
         </div>
       )}

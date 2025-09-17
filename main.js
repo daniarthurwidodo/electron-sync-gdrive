@@ -1,5 +1,6 @@
 const { app, BrowserWindow, ipcMain, shell, dialog } = require('electron');
 const path = require('path');
+const fs = require('fs').promises;
 const { google } = require('googleapis');
 const { OAuth2Client } = require('google-auth-library');
 const http = require('http');
@@ -10,7 +11,7 @@ let drive;
 let authServer;
 let mainWindow;
 
-const SCOPES = ['https://www.googleapis.com/auth/drive.readonly'];
+const SCOPES = ['https://www.googleapis.com/auth/drive.file'];
 
 function createWindow () {
   mainWindow = new BrowserWindow({
@@ -142,22 +143,149 @@ ipcMain.handle('select-folder', async () => {
   }
 });
 
+async function uploadFileToGoogleDrive(filePath, fileName, parentFolderId = null) {
+  try {
+    const fileMetadata = {
+      name: fileName,
+    };
+
+    if (parentFolderId) {
+      fileMetadata.parents = [parentFolderId];
+    }
+
+    const media = {
+      body: require('fs').createReadStream(filePath),
+    };
+
+    const response = await drive.files.create({
+      resource: fileMetadata,
+      media: media,
+      fields: 'id, name, size',
+    });
+
+    return { success: true, file: response.data };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+}
+
+async function createGoogleDriveFolder(folderName, parentFolderId = null) {
+  try {
+    const fileMetadata = {
+      name: folderName,
+      mimeType: 'application/vnd.google-apps.folder',
+    };
+
+    if (parentFolderId) {
+      fileMetadata.parents = [parentFolderId];
+    }
+
+    const response = await drive.files.create({
+      resource: fileMetadata,
+      fields: 'id, name',
+    });
+
+    return { success: true, folder: response.data };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+}
+
+async function uploadFolderContents(folderPath, parentFolderId = null) {
+  try {
+    const uploadResults = [];
+    const items = await fs.readdir(folderPath, { withFileTypes: true });
+
+    for (const item of items) {
+      const itemPath = path.join(folderPath, item.name);
+
+      if (item.isDirectory()) {
+        const folderResult = await createGoogleDriveFolder(item.name, parentFolderId);
+        if (folderResult.success) {
+          uploadResults.push({
+            type: 'folder',
+            name: item.name,
+            id: folderResult.folder.id,
+            success: true
+          });
+
+          const subFolderResults = await uploadFolderContents(itemPath, folderResult.folder.id);
+          uploadResults.push(...subFolderResults);
+        } else {
+          uploadResults.push({
+            type: 'folder',
+            name: item.name,
+            success: false,
+            error: folderResult.error
+          });
+        }
+      } else if (item.isFile()) {
+        const fileResult = await uploadFileToGoogleDrive(itemPath, item.name, parentFolderId);
+        uploadResults.push({
+          type: 'file',
+          name: item.name,
+          success: fileResult.success,
+          id: fileResult.success ? fileResult.file.id : null,
+          size: fileResult.success ? fileResult.file.size : null,
+          error: fileResult.success ? null : fileResult.error
+        });
+      }
+    }
+
+    return uploadResults;
+  } catch (error) {
+    throw new Error(`Failed to read folder contents: ${error.message}`);
+  }
+}
+
 ipcMain.handle('sync-gdrive', async (event, options = {}) => {
   try {
+    console.log('Starting upload with options:', options); // Debug logging
+
     if (!oauth2Client.credentials || !oauth2Client.credentials.access_token) {
+      console.log('Not authenticated'); // Debug logging
       return { success: false, error: 'Not authenticated' };
     }
 
-    const response = await drive.files.list({
-      pageSize: 10,
-      fields: 'nextPageToken, files(id, name, mimeType, size)',
-    });
-
-    const files = response.data.files;
     const folderPath = options.folderPath;
 
-    return { success: true, files, syncedFolder: folderPath };
+    if (!folderPath) {
+      console.log('No folder path provided'); // Debug logging
+      return { success: false, error: 'No folder path provided' };
+    }
+
+    console.log('Creating main folder for:', folderPath); // Debug logging
+    const folderName = path.basename(folderPath);
+    const mainFolderResult = await createGoogleDriveFolder(folderName);
+
+    if (!mainFolderResult.success) {
+      console.log('Failed to create main folder:', mainFolderResult.error); // Debug logging
+      return { success: false, error: `Failed to create main folder: ${mainFolderResult.error}` };
+    }
+
+    console.log('Uploading folder contents...'); // Debug logging
+    const uploadResults = await uploadFolderContents(folderPath, mainFolderResult.folder.id);
+
+    const totalFiles = uploadResults.filter(r => r.type === 'file').length;
+    const successfulFiles = uploadResults.filter(r => r.type === 'file' && r.success).length;
+    const totalFolders = uploadResults.filter(r => r.type === 'folder').length;
+    const successfulFolders = uploadResults.filter(r => r.type === 'folder' && r.success).length;
+
+    console.log('Upload completed successfully'); // Debug logging
+    return {
+      success: true,
+      mainFolder: mainFolderResult.folder,
+      uploadResults,
+      summary: {
+        totalFiles,
+        successfulFiles,
+        totalFolders,
+        successfulFolders,
+        failedItems: uploadResults.filter(r => !r.success)
+      }
+    };
   } catch (error) {
+    console.log('Upload error in main process:', error.message); // Debug logging
     return { success: false, error: error.message };
   }
 });
