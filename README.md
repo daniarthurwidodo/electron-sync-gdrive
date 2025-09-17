@@ -1,11 +1,13 @@
 # Electron Google Drive Sync
 
-A desktop application built with Electron and React that allows users to authenticate with Google and sync files from Google Drive.
+A desktop application built with Electron and React that allows users to authenticate with Google Drive and sync local folders with their Google Drive files.
 
 ## Features
 
-- Google OAuth authentication
-- Google Drive file synchronization
+- Google OAuth 2.0 authentication with automatic window focus after login
+- Browse and list Google Drive files
+- Local folder selection for synchronization
+- Real-time authentication status updates
 - Clean, modern UI built with React
 - Cross-platform desktop app powered by Electron
 
@@ -52,7 +54,18 @@ npm run package
 
 1. Launch the application
 2. Click "Authenticate with Google" to sign in to your Google account
-3. Once authenticated, click "Sync Google Drive" to fetch your files
+   - This will open your default browser for OAuth authentication
+   - After successful login, the app window will automatically regain focus
+3. Once authenticated, you'll see a green checkmark indicating successful login
+4. Click "Choose Folder" to select a local directory for synchronization
+5. Click "Sync Google Drive" to start the sync process and view your Drive files
+
+## How It Works
+
+- **Authentication**: Uses Google OAuth 2.0 with a local callback server on port 8081
+- **IPC Communication**: Electron's main and renderer processes communicate via IPC for secure API calls
+- **File Listing**: Currently displays the first 10 files from your Google Drive
+- **Local Integration**: Allows selection of local folders for future sync functionality
 
 ## Tech Stack
 

@@ -1,16 +1,19 @@
-const { app, BrowserWindow, ipcMain, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, dialog } = require('electron');
 const path = require('path');
 const { google } = require('googleapis');
 const { OAuth2Client } = require('google-auth-library');
+const http = require('http');
 require('dotenv').config();
 
 let oauth2Client;
 let drive;
+let authServer;
+let mainWindow;
 
 const SCOPES = ['https://www.googleapis.com/auth/drive.readonly'];
 
 function createWindow () {
-  const win = new BrowserWindow({
+  mainWindow = new BrowserWindow({
     width: 800,
     height: 600,
     webPreferences: {
@@ -19,14 +22,20 @@ function createWindow () {
     }
   });
 
-  win.loadURL('http://localhost:8080');
+  mainWindow.loadURL('http://localhost:8080');
+
+  mainWindow.on('focus', () => {
+    if (oauth2Client && oauth2Client.credentials && oauth2Client.credentials.access_token) {
+      mainWindow.webContents.send('auth-status-changed', { authenticated: true });
+    }
+  });
 }
 
 async function initializeGoogleAuth() {
   oauth2Client = new OAuth2Client(
     process.env.GOOGLE_DRIVE_CLIENT_ID,
     process.env.GOOGLE_DRIVE_CLIENT_SECRET,
-    'http://localhost:3000/oauth2callback'
+    'http://localhost:8081/oauth2callback'
   );
 
   drive = google.drive({ version: 'v3', auth: oauth2Client });
@@ -39,45 +48,67 @@ ipcMain.handle('google-auth', async () => {
       scope: SCOPES,
     });
 
-    await shell.openExternal(authUrl);
-
     return new Promise((resolve) => {
-      const authWindow = new BrowserWindow({
-        width: 500,
-        height: 600,
-        show: false,
-        webPreferences: {
-          nodeIntegration: false,
-          contextIsolation: true
-        }
-      });
+      authServer = http.createServer((req, res) => {
+        const url = new URL(req.url, 'http://localhost:8081');
 
-      authWindow.loadURL(authUrl);
-      authWindow.show();
-
-      authWindow.webContents.on('will-redirect', async (event, navigationUrl) => {
-        const parsedUrl = new URL(navigationUrl);
-
-        if (parsedUrl.pathname === '/oauth2callback') {
-          const code = parsedUrl.searchParams.get('code');
+        if (url.pathname === '/oauth2callback') {
+          const code = url.searchParams.get('code');
+          const error = url.searchParams.get('error');
 
           if (code) {
-            try {
-              const { tokens } = await oauth2Client.getToken(code);
-              oauth2Client.setCredentials(tokens);
+            res.writeHead(200, { 'Content-Type': 'text/html' });
+            res.end(`
+              <html>
+                <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
+                  <h2>✅ Authentication Successful!</h2>
+                  <p>You can now close this tab and return to the application.</p>
+                  <script>setTimeout(() => window.close(), 3000);</script>
+                </body>
+              </html>
+            `);
 
-              authWindow.close();
-              resolve({ success: true });
-            } catch (error) {
-              authWindow.close();
-              resolve({ success: false, error: error.message });
-            }
+            oauth2Client.getToken(code)
+              .then(({ tokens }) => {
+                oauth2Client.setCredentials(tokens);
+                authServer.close();
+                if (mainWindow) {
+                  mainWindow.webContents.send('auth-status-changed', { authenticated: true });
+                  mainWindow.focus();
+                  mainWindow.show();
+                  if (mainWindow.isMinimized()) {
+                    mainWindow.restore();
+                  }
+                }
+                resolve({ success: true });
+              })
+              .catch((error) => {
+                authServer.close();
+                resolve({ success: false, error: error.message });
+              });
+          } else if (error) {
+            res.writeHead(200, { 'Content-Type': 'text/html' });
+            res.end(`
+              <html>
+                <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
+                  <h2>❌ Authentication Failed</h2>
+                  <p>Authentication was denied or cancelled.</p>
+                  <script>setTimeout(() => window.close(), 3000);</script>
+                </body>
+              </html>
+            `);
+            authServer.close();
+            resolve({ success: false, error: 'Authentication denied' });
           }
         }
       });
 
-      authWindow.on('closed', () => {
-        resolve({ success: false, error: 'Authentication cancelled' });
+      authServer.listen(8081, () => {
+        shell.openExternal(authUrl);
+      });
+
+      authServer.on('error', (error) => {
+        resolve({ success: false, error: `Server error: ${error.message}` });
       });
     });
   } catch (error) {
@@ -85,7 +116,33 @@ ipcMain.handle('google-auth', async () => {
   }
 });
 
-ipcMain.handle('sync-gdrive', async () => {
+ipcMain.handle('check-auth-status', async () => {
+  try {
+    const isAuthenticated = oauth2Client && oauth2Client.credentials && oauth2Client.credentials.access_token;
+    return { success: true, authenticated: isAuthenticated };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('select-folder', async () => {
+  try {
+    const result = await dialog.showOpenDialog({
+      properties: ['openDirectory'],
+      title: 'Select folder to sync with Google Drive'
+    });
+
+    if (result.canceled) {
+      return { success: false, error: 'Selection cancelled' };
+    }
+
+    return { success: true, folderPath: result.filePaths[0] };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('sync-gdrive', async (event, options = {}) => {
   try {
     if (!oauth2Client.credentials || !oauth2Client.credentials.access_token) {
       return { success: false, error: 'Not authenticated' };
@@ -97,7 +154,9 @@ ipcMain.handle('sync-gdrive', async () => {
     });
 
     const files = response.data.files;
-    return { success: true, files };
+    const folderPath = options.folderPath;
+
+    return { success: true, files, syncedFolder: folderPath };
   } catch (error) {
     return { success: false, error: error.message };
   }
